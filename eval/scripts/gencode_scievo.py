@@ -9,6 +9,7 @@ from scicode.parse.parse import (
     get_function_from_code,
     read_from_hf_dataset,
 )
+from tqdm import tqdm
 
 if p := os.getenv("SCIEVO_DIR"):
     sys.path.insert(0, p)
@@ -68,6 +69,7 @@ class Gencode:
         prompt_template=DEFAULT_PROMPT_TEMPLATE,
         *,
         save: bool = True,
+        resume: bool = False,
     ) -> None:
         """
 
@@ -86,6 +88,23 @@ class Gencode:
             / self._get_background_dir()
             / f"{prob_id}.{num_steps}.py"
         )
+        bg_dir = self.output_dir / Path(self.model).parts[-1] / self._get_background_dir()
+        if resume:
+            existing_files = bg_dir.glob(f"{prob_id}.*.py")
+            max_step = max(
+                [
+                    int(f.stem.split(".")[1])
+                    for f in existing_files
+                    if f.stem.split(".")[0] == prob_id
+                ],
+                default=0,
+            )
+            if max_step >= num_steps:
+                print(
+                    f"Step {num_steps} for problem {prob_id} already exists. Skipping generation."
+                )
+                return
+
         if num_steps == 1:
             self.previous_llm_code = [None] * tot_steps
         else:
@@ -230,6 +249,11 @@ def get_cli() -> argparse.ArgumentParser:
         default=0,
         help="Generation temperature",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume generation from existing outputs if enabled",
+    )
     return parser
 
 
@@ -240,6 +264,7 @@ def main(
     prompt_dir: Path,
     with_background: bool,
     temperature: float,
+    resume: bool,
 ) -> None:
     gcode = Gencode(
         model=model,
@@ -250,7 +275,7 @@ def main(
     )
     prompt_template = BACKGOUND_PROMPT_TEMPLATE if with_background else DEFAULT_PROMPT_TEMPLATE
     data = read_from_hf_dataset(split)
-    for problem in data:
+    for problem in tqdm(data):
         prob_id = problem["problem_id"]
         steps = len(problem["sub_steps"])
         print(f"Generating {prob_id}...")
@@ -261,7 +286,9 @@ def main(
                 or (prob_id == "76" and i == 2)
             ):
                 continue
-            gcode.generate_response_with_steps(problem, i + 1, steps, model, prompt_template)
+            gcode.generate_response_with_steps(
+                problem, i + 1, steps, model, prompt_template, resume=resume
+            )
 
 
 if __name__ == "__main__":
