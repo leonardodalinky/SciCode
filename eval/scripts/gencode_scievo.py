@@ -40,6 +40,7 @@ class Gencode:
         self.with_background = with_background
         self.temperature = temperature
         self.previous_llm_code = []
+        self.error_cases: set[tuple[int, int]] = set()
 
     def _get_background_dir(self):
         return "with_background" if self.with_background else "without_background"
@@ -57,7 +58,9 @@ class Gencode:
         output_dir.mkdir(parents=True, exist_ok=True)
         prob_id = prob_data["problem_id"]
         output_file_path = output_dir / f"{prob_id}.{num_steps}.py"
-        python_code = extract_python_script(response)
+        is_ok, python_code = extract_python_script(response)
+        if not is_ok:
+            self.error_cases.add((int(prob_id), num_steps))
         output_file_path.write_text(f"{previous_code}\n{python_code}", encoding="utf-8")
 
     def generate_response_with_steps(
@@ -69,7 +72,6 @@ class Gencode:
         prompt_template=DEFAULT_PROMPT_TEMPLATE,
         *,
         save: bool = True,
-        resume: bool = False,
     ) -> None:
         """
 
@@ -88,23 +90,6 @@ class Gencode:
             / self._get_background_dir()
             / f"{prob_id}.{num_steps}.py"
         )
-        bg_dir = self.output_dir / Path(self.model).parts[-1] / self._get_background_dir()
-        if resume:
-            existing_files = bg_dir.glob(f"{prob_id}.*.py")
-            max_step = max(
-                [
-                    int(f.stem.split(".")[1])
-                    for f in existing_files
-                    if f.stem.split(".")[0] == prob_id
-                ],
-                default=0,
-            )
-            if max_step >= num_steps:
-                print(
-                    f"Step {num_steps} for problem {prob_id} already exists. Skipping generation."
-                )
-                return
-
         if num_steps == 1:
             self.previous_llm_code = [None] * tot_steps
         else:
@@ -127,10 +112,16 @@ class Gencode:
                         )
                     if prev_file_path.is_file():
                         prev_file_content = prev_file_path.read_text(encoding="utf-8")
-                        func_name = extract_function_name(
-                            prob_data["sub_steps"][prev_step]["function_header"]
-                        )
-                        function_code = get_function_from_code(prev_file_content, func_name)
+                        try:
+                            func_name = extract_function_name(
+                                prob_data["sub_steps"][prev_step]["function_header"]
+                            )
+                        except Exception:
+                            self.error_cases.add((int(prob_id), prev_step + 1))
+                            raise
+                        is_ok, function_code = get_function_from_code(prev_file_content, func_name)
+                        if not is_ok:
+                            self.error_cases.add((int(prob_id), prev_step + 1))
                         self.previous_llm_code[prev_step] = function_code
                     else:
                         raise Exception(
@@ -155,7 +146,9 @@ class Gencode:
         # NOTE(kelin): SciEvo generation
         response_from_llm = run_coding_workflow(user_query=prompt)
 
-        self.previous_llm_code[num_steps - 1] = extract_python_script(response_from_llm)
+        is_ok, self.previous_llm_code[num_steps - 1] = extract_python_script(response_from_llm)
+        if not is_ok:
+            self.error_cases.add((int(prob_id), num_steps))
         self.save_response_with_steps(prob_data, response_from_llm, previous_code, num_steps)
 
     @staticmethod
@@ -250,9 +243,9 @@ def get_cli() -> argparse.ArgumentParser:
         help="Generation temperature",
     )
     parser.add_argument(
-        "--resume",
+        "--clear-errors",
         action="store_true",
-        help="Resume generation from existing outputs if enabled",
+        help="Clear error cases if enabled",
     )
     return parser
 
@@ -264,7 +257,7 @@ def main(
     prompt_dir: Path,
     with_background: bool,
     temperature: float,
-    resume: bool,
+    clear_errors: bool,
 ) -> None:
     gcode = Gencode(
         model=model,
@@ -286,9 +279,16 @@ def main(
                 or (prob_id == "76" and i == 2)
             ):
                 continue
-            gcode.generate_response_with_steps(
-                problem, i + 1, steps, model, prompt_template, resume=resume
-            )
+            gcode.generate_response_with_steps(problem, i + 1, steps, model, prompt_template)
+
+    if clear_errors and gcode.error_cases and len(gcode.error_cases) > 0:
+        logger.warning(f"Total {len(gcode.error_cases)} error cases: {gcode.error_cases}")
+        bg_dir = gcode.output_dir / Path(gcode.model).parts[-1] / gcode._get_background_dir()
+        prob_id_set = set([str(prob_id) for prob_id, _ in gcode.error_cases])
+        logger.info(f"Begin to clear error cases: {prob_id_set}")
+        for prob_id in prob_id_set:
+            for file in bg_dir.glob(f"{prob_id}.*.py"):
+                file.unlink()
 
 
 if __name__ == "__main__":
