@@ -11,11 +11,11 @@ from scicode.parse.parse import (
 )
 from tqdm import tqdm
 
-if p := os.getenv("SCIEVO_DIR"):
+if p := os.getenv("SCIDER_DIR"):
     sys.path.insert(0, p)
 else:
     raise ImportError(
-        "SCIEVO_DIR environment variable not set. Please set it to the root directory of SciEvo."
+        "SCIDER_DIR environment variable not set. Please set it to the root directory of SciDER."
     )
 
 from bench_workflows.register_models.gemini import register_gemini_low_medium_models
@@ -143,7 +143,7 @@ class Gencode:
         # # write the response to a file if it doesn't exist
         # model_fct = get_model_function(model, **model_kwargs)
 
-        # NOTE(kelin): SciEvo generation
+        # NOTE(kelin): SciDER generation
         response_from_llm = run_coding_workflow(user_query=prompt)
 
         is_ok, self.previous_llm_code[num_steps - 1] = extract_python_script(response_from_llm)
@@ -300,7 +300,7 @@ if __name__ == "__main__":
 
     args = get_cli().parse_args()
 
-    # NOTE (kelin): SciEvo models registration
+    # NOTE (kelin): SciDER models registration
     register_gemini_low_medium_models()
 
     main(**vars(args))
