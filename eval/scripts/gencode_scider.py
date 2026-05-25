@@ -4,11 +4,7 @@ import sys
 from pathlib import Path
 
 from scicode.gen.models import extract_python_script, get_model_function
-from scicode.parse.parse import (
-    extract_function_name,
-    get_function_from_code,
-    read_from_hf_dataset,
-)
+from scicode.parse.parse import extract_function_name, get_function_from_code, read_from_hf_dataset
 from tqdm import tqdm
 
 if p := os.getenv("SCIDER_DIR"):
@@ -18,8 +14,12 @@ else:
         "SCIDER_DIR environment variable not set. Please set it to the root directory of SciDER."
     )
 
-from bench_workflows.register_models.gemini import register_gemini_low_medium_models
-from bench_workflows.scicodebench_workflow import run_coding_workflow
+from bench_workflows.scicodebench_workflow import (
+    DEFAULT_CODE_FILENAME,
+    ROLES_YAML_PATH,
+    run_coding_workflow,
+)
+from scider.default.models import register_defaults_from_yaml
 
 DEFAULT_PROMPT_TEMPLATE = Path("eval", "data", "background_comment_template.txt").read_text()
 BACKGOUND_PROMPT_TEMPLATE = Path("eval", "data", "multistep_template.txt").read_text()
@@ -33,12 +33,16 @@ class Gencode:
         prompt_dir: Path,
         with_background: bool,
         temperature: float,
+        workspace_root: Path | None = None,
+        scicode_venv: Path | None = None,
     ):
         self.model = model
         self.output_dir = output_dir
         self.prompt_dir = prompt_dir
         self.with_background = with_background
         self.temperature = temperature
+        self.workspace_root = workspace_root
+        self.scicode_venv = scicode_venv
         self.previous_llm_code = []
         self.error_cases: set[tuple[int, int]] = set()
 
@@ -54,14 +58,18 @@ class Gencode:
     def save_response_with_steps(
         self, prob_data: dict, response: str, previous_code: str, num_steps: int
     ) -> None:
+        """Persist the per-step solution. With the redesigned workflow,
+        ``response`` is the literal code.py content from the agent's
+        workspace (no markdown extraction needed). An empty string means
+        the agent failed to produce code.py — recorded as an error case.
+        """
         output_dir = self.output_dir / Path(self.model).parts[-1] / self._get_background_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         prob_id = prob_data["problem_id"]
         output_file_path = output_dir / f"{prob_id}.{num_steps}.py"
-        is_ok, python_code = extract_python_script(response)
-        if not is_ok:
+        if not response.strip():
             self.error_cases.add((int(prob_id), num_steps))
-        output_file_path.write_text(f"{previous_code}\n{python_code}", encoding="utf-8")
+        output_file_path.write_text(f"{previous_code}\n{response}", encoding="utf-8")
 
     def generate_response_with_steps(
         self,
@@ -143,13 +151,32 @@ class Gencode:
         # # write the response to a file if it doesn't exist
         # model_fct = get_model_function(model, **model_kwargs)
 
-        # NOTE(kelin): SciDER generation
-        response_from_llm = run_coding_workflow(user_query=prompt)
+        # NOTE(kelin): SciDER generation. With the workspace-based
+        # workflow, the workspace dir is per-(problem, step) under
+        # ``--workspace-root``. The agent writes ./code.py there and
+        # ``run_coding_workflow`` returns its literal contents — no
+        # markdown/regex extraction needed.
+        if self.workspace_root is None:
+            raise ValueError(
+                "Gencode requires --workspace-root since the SciDER coding "
+                "workflow now writes ./code.py to a per-task workspace."
+            )
+        task_workspace = (
+            self.workspace_root
+            / Path(self.model).parts[-1]
+            / self._get_background_dir()
+            / f"{prob_id}_{num_steps}"
+        )
+        code_from_agent = run_coding_workflow(
+            user_query=prompt,
+            workspace_dir=task_workspace,
+            scicode_venv=self.scicode_venv,
+        )
 
-        is_ok, self.previous_llm_code[num_steps - 1] = extract_python_script(response_from_llm)
-        if not is_ok:
+        if not code_from_agent.strip():
             self.error_cases.add((int(prob_id), num_steps))
-        self.save_response_with_steps(prob_data, response_from_llm, previous_code, num_steps)
+        self.previous_llm_code[num_steps - 1] = code_from_agent
+        self.save_response_with_steps(prob_data, code_from_agent, previous_code, num_steps)
 
     @staticmethod
     def process_problem_code(prob_data: dict, num_steps: int) -> str:
@@ -247,6 +274,24 @@ def get_cli() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear error cases if enabled",
     )
+    parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=Path("eval_results", "workspaces"),
+        help="Root dir for per-(problem, step) agent workspaces. Each "
+        "task gets <workspace_root>/<model>/<bg_dir>/<prob_id>_<step>/ "
+        "where the agent writes its code.py + leaves a full conversation "
+        "trace. Required by the new SciDER coding workflow.",
+    )
+    parser.add_argument(
+        "--scicode-venv",
+        type=Path,
+        default=None,
+        help="Optional path to a shared Python venv with the SciCode "
+        "scientific stack (numpy, scipy, sympy, matplotlib, ...). When "
+        "set, its bin/ is prepended to the agent's shell PATH so it can "
+        "self-test generated code with python -c \"...\" before finishing.",
+    )
     return parser
 
 
@@ -258,13 +303,25 @@ def main(
     with_background: bool,
     temperature: float,
     clear_errors: bool,
+    workspace_root: Path,
+    scicode_venv: Path | None,
 ) -> None:
+    if scicode_venv is not None and not (scicode_venv / "bin" / "python").exists():
+        from loguru import logger as _l
+
+        _l.warning(
+            "scicode_venv={} has no bin/python — PATH injection will still "
+            "happen but the agent may not find the expected interpreter.",
+            scicode_venv,
+        )
     gcode = Gencode(
         model=model,
         output_dir=output_dir,
         prompt_dir=prompt_dir,
         with_background=with_background,
         temperature=temperature,
+        workspace_root=workspace_root,
+        scicode_venv=scicode_venv,
     )
     prompt_template = BACKGOUND_PROMPT_TEMPLATE if with_background else DEFAULT_PROMPT_TEMPLATE
     data = read_from_hf_dataset(split)
@@ -300,7 +357,9 @@ if __name__ == "__main__":
 
     args = get_cli().parse_args()
 
-    # NOTE (kelin): SciDER models registration
-    register_gemini_low_medium_models()
+    # NOTE (kelin): SciDER models registration. Role assignments live in
+    # ``<SCIDER_DIR>/bench_workflows/model_configs/scicodebench_roles.yaml``
+    # — edit that yaml to swap models.
+    register_defaults_from_yaml(ROLES_YAML_PATH)
 
     main(**vars(args))
